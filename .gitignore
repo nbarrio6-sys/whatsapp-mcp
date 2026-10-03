@@ -1,3 +1,25 @@
+# Datos sensibles — mensajes reales de WhatsApp, nunca deben subirse a git
+whatsapp-bridge/store/
 *.db
-claude_desktop_config.json
-whatsapp.log
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Binarios compilados
+whatsapp-bridge/whatsapp-client.exe
+whatsapp-bridge/whatsapp-client.exe~
+*.exe
+*.exe~
+
+# Logs
+*.log
+whatsapp-bridge/.claude_last_checked_supervisor_msg
+
+# Salida generada por Graphify (se regenera con `graphify .`)
+whatsapp-bridge/graphify-out/
+graphify-out/
+
+# Notas y logs personales que no son parte del código del bridge
+whatsapp_log.json
+whatsapp_gym_log.json
+Capital Allocator AI - *.md
