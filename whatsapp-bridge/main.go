@@ -21,6 +21,12 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"bytes"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
+
+	"golang.org/x/image/draw"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -185,7 +191,20 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media messages (image/video/document) carry their caption in a
+	// dedicated Caption field on the corresponding sub-message, not in
+	// Conversation/ExtendedTextMessage - check those next.
+	if image := msg.GetImageMessage(); image != nil && image.GetCaption() != "" {
+		return image.GetCaption()
+	}
+	if video := msg.GetVideoMessage(); video != nil && video.GetCaption() != "" {
+		return video.GetCaption()
+	}
+	if document := msg.GetDocumentMessage(); document != nil && document.GetCaption() != "" {
+		return document.GetCaption()
+	}
+
+	// For now, we're ignoring other non-text messages
 	return ""
 }
 
@@ -372,26 +391,48 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 }
 
 // Extract media info from a message
-func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+// sanitizeFilenameID strips characters that aren't safe in a filename, so a
+// WhatsApp message ID can be embedded directly into the generated filename.
+func sanitizeFilenameID(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
+}
+
+func extractMediaInfo(msg *waProto.Message, messageID string) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
 
+	// The generated filename must be unique per message, so it doubles as the
+	// on-disk storage key in downloadMedia(). A timestamp alone (previously
+	// time.Now() at second resolution) collides whenever multiple media
+	// messages arrive within the same second - the WhatsApp message ID is
+	// unique per message and is used here instead.
+	idPart := sanitizeFilenameID(messageID)
+
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", "image_" + idPart + ".jpg",
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", "video_" + idPart + ".mp4",
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", "audio_" + idPart + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -399,7 +440,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + idPart
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
@@ -427,7 +468,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	content := extractTextContent(msg.Message)
 
 	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msg.Info.ID)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -554,6 +595,44 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 }
 
 // Function to download media from a message
+// Vouchers (Yape/Plin screenshots) have large, simple text and don't need
+// full resolution to be read by vision analysis - downscaling and
+// recompressing what download_media serves cuts the image-analysis token
+// cost without losing legibility. The untouched original is always kept
+// separately (see downloadMedia) in case full detail is ever needed.
+const maxServedImageDimension = 1000
+const servedImageJPEGQuality = 80
+
+func compressImageForServing(data []byte) ([]byte, error) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode image: %v", err)
+	}
+
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+
+	if width > maxServedImageDimension || height > maxServedImageDimension {
+		var newWidth, newHeight int
+		if width >= height {
+			newWidth = maxServedImageDimension
+			newHeight = int(float64(height) * float64(maxServedImageDimension) / float64(width))
+		} else {
+			newHeight = maxServedImageDimension
+			newWidth = int(float64(width) * float64(maxServedImageDimension) / float64(height))
+		}
+		resized := image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
+		draw.CatmullRom.Scale(resized, resized.Bounds(), img, bounds, draw.Over, nil)
+		img = resized
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: servedImageJPEGQuality}); err != nil {
+		return nil, fmt.Errorf("failed to encode compressed image: %v", err)
+	}
+	return buf.Bytes(), nil
+}
+
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
 	var mediaType, filename, url string
@@ -647,13 +726,39 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
-	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	// Preserve the untouched original before any compression - localPath
+	// (returned to callers below) may end up holding a downscaled copy for
+	// images, so the full-resolution bytes are kept separately in case
+	// they're ever needed.
+	originalDir := fmt.Sprintf("%s/originals", chatDir)
+	if err := os.MkdirAll(originalDir, 0755); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to create originals directory: %v", err)
+	}
+	originalPath := fmt.Sprintf("%s/%s", originalDir, filename)
+	if err := os.WriteFile(originalPath, mediaData, 0644); err != nil {
+		fmt.Printf("DEBUG original file write error for message %s: %v\n", messageID, err)
+		return false, "", "", "", fmt.Errorf("failed to save original media file: %v", err)
+	}
+
+	// Images get downscaled/recompressed for what we actually serve, since
+	// vision analysis of a voucher screenshot doesn't need full resolution.
+	// Other media types are served as downloaded.
+	dataToServe := mediaData
+	if mediaType == "image" {
+		if compressed, err := compressImageForServing(mediaData); err != nil {
+			fmt.Printf("WARN: failed to compress image for message %s, serving original: %v\n", messageID, err)
+		} else {
+			dataToServe = compressed
+		}
+	}
+
+	// Save the (possibly compressed) media to file
+	if err := os.WriteFile(localPath, dataToServe, 0644); err != nil {
 		fmt.Printf("DEBUG file write error for message %s: %v\n", messageID, err)
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+	fmt.Printf("Successfully downloaded %s media to %s (%d bytes, original %d bytes)\n", mediaType, absPath, len(dataToServe), len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 
@@ -851,6 +956,12 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+
+		case *events.UndecryptableMessage:
+			logger.Warnf("UNDECRYPTABLE MESSAGE from %s in chat %s (unavailableType=%s, isUnavailable=%v)", v.Info.Sender.String(), v.Info.Chat.String(), v.UnavailableType, v.IsUnavailable)
+
+		default:
+			logger.Infof("Unhandled event type: %T", evt)
 		}
 	})
 
@@ -1064,13 +1175,22 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 				}
 
+				// Message ID is needed by extractMediaInfo to build a
+				// collision-free filename - compute it before that call
+				// (it used to only be computed further below, after media
+				// info was already extracted).
+				historyMsgID := ""
+				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
+					historyMsgID = *msg.Message.Key.ID
+				}
+
 				// Extract media info
 				var mediaType, filename, url string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
 				var fileLength uint64
 
 				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, historyMsgID)
 				}
 
 				// Log the message content for debugging
@@ -1099,11 +1219,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					sender = jid.User
 				}
 
-				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
-				}
+				// Store message (reuse the ID computed above for extractMediaInfo)
+				msgID := historyMsgID
 
 				// Get message timestamp
 				timestamp := time.Time{}
